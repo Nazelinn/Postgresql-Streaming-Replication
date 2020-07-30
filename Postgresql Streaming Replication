@@ -1,0 +1,189 @@
+
+Öncelikle kurmak istediğiniz Postgresql versiyonu ve işletim sistemine karar vermeniz gerekmektedir , ben örnek olarak Postgresql 11 versiyonu ve 
+işletim sistemi olarak da Centos 7 üzerine kurmaya karar verdim aşağıdaki adımlar da bunlar için geçerlidir.
+
+Streaming Replication Nedir ?
+Streaming Replikasyon, XLOG kayıtlarının yani verinin fiziksel olarak farklı bir sunucu üzerine sürekli olarak aktarılması anlamına gelmekte , Fiziksel replikasyon, Hot Standby sunucu ihtiyaçlarımızı yani karşı tarafta tüm PostgreSQL sunucunun bir kopyasını (veri, roller, kullanıcılar vb) 
+güncel olarak tutmamızı sağlıyor.
+
+ 1 - Master ve Slave olarak belirdiğimiz iki sunucu üzerine öncelikle Postgresql 11  kurulumunu gerçekleştiiryoruz centos 7 üzerine 
+
+Postgresql kurulumu için gerekli olan yum paketlerini yüklüyoruz
+yum install https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm 
+yum install postgresql11 
+yum install postgresql11-server 
+/usr/pgsql-11/bin/postgresql-11-setup initdb
+systemctl enable postgresql-11
+systemctl enable postgresql.service
+systemctl start postgresql-11
+systemctl start firewalld
+systemctl enable firewalld
+firewall-cmd --add-service=postgresql --permanent
+firewall-cmd --reload
+firewall-cmd --list-all 
+
+
+ 2 - Postgresql de  Master olarak belirlediğimiz sunucumuzun üzerine ilgili konfigurasyonlarımızı ayarlıyoruz
+
+ 192.168.46.141 -- master 4 GB RAM , 2 GB CPU 
+ 192.168.46.143  --slave  4 GB RAM , 2 GB CPU 
+Masterda öncelikle postgresql.conf dosyasında aşağıdaki değişiklikleri yapıyoruz 
+[root@nazelin-test-04 ~]# vi /var/lib/pgsql/11/data/postgresql.conf  
+  listen_addresses = '*'
+  wal_level = hot_standby
+  synchronous_commit = local
+  archive_mode = on
+  archive_command = 'cp %p /var/lib/pgsql/11/archive/%f'
+  max_wal_senders = 2 --2 replica olacak eğer 3 nodeluolursa o zaman 3 olmalı bu değer 
+  wal_keep_segments = 10
+  synchronous_standby_names = 'pgslave01'  --replica ismimiz
+  max_connections = 100
+  shared_buffers = 1GB
+  effective_cache_size = 3GB
+  maintenance_work_mem = 256MB
+ checkpoint_completion_target = 0.7
+ wal_buffers = 16MB
+ default_statistics_target = 100
+ random_page_cost = 1.1
+ effective_io_concurrency = 200
+ work_mem = 10485kB
+ min_wal_size = 1GB
+ max_wal_size = 4GB
+ max_worker_processes = 2
+ max_parallel_workers_per_gather = 1
+ max_parallel_workers = 2
+ max_parallel_maintenance_workers = 1
+  :wq!
+ilgili değişiklikleri kaydettikten sonra archive_command için  belirlemiş olduğumuz dizinlerimizi oluşturup gerekli yetkilerini atıyoruz.
+[root@nazelin-test-04 ~]# mkdir -p /var/lib/pgsql/11/archive/ 
+[root@nazelin-test-04 ~]# chmod 700 /var/lib/pgsql/11/archive/  
+[root@nazelin-test-04 ~]# chown -R postgres:postgres /var/lib/pgsql/11/archive/ 
+
+Sonrasında pg_hba.conf da master ve slave için host tanımlarını yapıyoruz 
+[root@nazelin-test-04 ~]# vi /var/lib/pgsql/11/data/pg_hba.conf
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                      md5
+# IPv4 local connections:
+host   all             all                 0.0.0.0/0             md5              
+# PostgreSQL Master IP address
+ host    replication     replica          192.168.46.141/32      md5
+# PostgreSQL SLave IP address
+ host    replication     replica          192.168.46.143/32      md5
+
+Sonrasında yaptığımız değişikliklerin algılanması için postgresql servisini restart edip replication için replica  userını oluşturuyoruz 
+
+[root@nazelin-test-04 ~]# systemctl restart postgresql-11  
+[root@nazelin-test-04 ~]# su - postgres
+Last login: Tue Jul 14 14:49:10 +03 2020 on pts/0
+-bash-4.2$ psql
+Password for user postgres:
+psql (11.8)
+Type "help" for help.
+postgres=# create user replica replication;   
+createuser --replication -P replica
+create user replica replication;
+
+Enter New Password:xxxx
+
+3 - Son olarak  Slave server için ayarlarımızı yapıyoruz, öncelikle slave de postgresql servisini durduruyoruz
+
+[root@nazelin-test-05 ~]# systemctl stop postgresql-11
+
+Sonrasında data dizinine gidip var olan data yı data-backup olarak yeniden rename edip yeni data klasörünü oluşturup yetkileri tanımlayıp sonrasında  master sunucumuzdan pg_basebackup alarak kopyalıyoruz
+
+[root@nazelin-test-05 ~]# cd /var/lib/pgsql/11/
+[root@nazelin-test-05 11]# ll
+total 12
+drwx------  2 postgres postgres    6 May 14 00:26 backups
+drwx------ 20 postgres postgres 4096 Jul 30 00:00 data
+drwx------ 20 postgres postgres 4096 Jul 13 15:30 data-backup
+-rw-------  1 postgres postgres  922 Jul 13 15:30 initdb.log 
+
+[root@nazelin-test-05 11]# mv data data-backup  
+[root@nazelin-test-05 11]# mkdir -p data/
+[root@nazelin-test-05 11]# chmod 700 data/   
+[root@nazelin-test-05 11]# chown -R postgres:postgres data/
+[root@nazelin-test-05 11]# su - postgres
+Last login: Mon Jul 13 15:47:09 +03 2020 on pts/0
+-bash-4.2$ pg_basebackup -h 192.168.46.141 -U replica -D /var/lib/pgsql/11/data -P --xlog
+
+Masterdan data dizinin kopyaladıktan sonra postgresql.conf da aşağıdaki değişiklikleri yapıyoruz 
+[root@nazelin-test-05 11]# cd /var/lib/pgsql/11/data/ 
+vi postgresql.conf
+listen_addresses = '*'
+hot_standby = on
+vi recovery.conf
+standby_mode = 'on'
+max_connections = 100
+shared_buffers = 1GB
+effective_cache_size = 3GB
+maintenance_work_mem = 256MB
+checkpoint_completion_target = 0.7
+wal_buffers = 16MB
+default_statistics_target = 100
+random_page_cost = 1.1
+effective_io_concurrency = 200
+work_mem = 10485kB
+min_wal_size = 1GB
+max_wal_size = 4GB
+max_worker_processes = 2
+max_parallel_workers_per_gather = 1
+max_parallel_workers = 2
+max_parallel_maintenance_workers = 1
+:wq!
+Kaydedip çıktıktan sonra recovery.conf dosyasında master sunucusunun bilgileri belirterek slave server da replication ayaga kaldırıyoruz 
+[root@nazelin-test-05 11]# vi recovery.conf 
+primary_conninfo = 'host=192.168.46.141 port=5432 user=replica password=123456 application_name=pgslave01'
+trigger_file = '/tmp/postgresql.trigger.5432'
+
+[root@nazelin-test-05 11]# chmod 600 recovery.conf 
+[root@nazelin-test-05 11]# chown postgres:postgres recovery.conf 
+
+Yapılan değişiklikleriden sonra postgresql servisini yeniden başlatıyoruz slave sunucusunda 
+[root@nazelin-test-05 11]# systemctl start postgresql-11 
+
+
+4 - Master sunucusunda test etme adımlarımız
+
+[root@nazelin-test-04 ~]# su - postgres
+Last login: Thu Jul 30 15:43:43 +03 2020 on pts/0
+-bash-4.2$ psql
+Password for user postgres:
+psql (11.8)
+Type "help" for help.
+postgres=# select application_name, state, sync_priority, sync_state from pg_stat_replication;
+-[ RECORD 1 ]----+----------
+application_name | pgslave01
+state            | streaming
+sync_priority    | 1
+sync_state       | sync    
+
+postgres=# select * from pg_stat_replication;
+-[ RECORD 1 ]----+------------------------------
+pid              | 7897
+usesysid         | 16384
+usename          | replica
+application_name | pgslave01
+client_addr      | 192.168.46.143
+client_hostname  |
+client_port      | 39990
+backend_start    | 2020-07-13 15:39:55.835352+03
+backend_xmin     |
+state            | streaming
+sent_lsn         | 0/12005580
+write_lsn        | 0/12005580
+flush_lsn        | 0/12005580
+replay_lsn       | 0/12005580
+write_lag        |
+flush_lag        |
+replay_lag       |
+sync_priority    | 1
+sync_state       | sync                  
+
+
+
+  
+  
+  
